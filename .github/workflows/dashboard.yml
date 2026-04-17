@@ -17,7 +17,10 @@ permissions:
 
 jobs:
   refresh:
-    runs-on: ubuntu-latest
+    # Self-hosted runner on a Procore-VPN-connected Mac.
+    # Label 'e2e-dashboard' is applied during runner registration so this
+    # workflow only dispatches to the right machine if you ever add more runners.
+    runs-on: [self-hosted, macOS, e2e-dashboard]
     timeout-minutes: 10
     steps:
       - name: Check out repo
@@ -34,10 +37,11 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
       - name: Run dashboard refresh
         env:
+          PYTHONUNBUFFERED: "1"   # stream prints live to the GitHub Actions log
           ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
           ATLASSIAN_TOKEN: ${{ secrets.ATLASSIAN_TOKEN }}
           ATLASSIAN_DOMAIN: ${{ secrets.ATLASSIAN_DOMAIN || 'procoretech.atlassian.net' }}
