@@ -1,0 +1,62 @@
+name: Refresh E2E Dashboard
+
+on:
+  schedule:
+    # 5:00 PM India Standard Time every weekday.
+    # IST is UTC+5:30 (no DST) -> 5 PM IST = 11:30 UTC.
+    - cron: "30 11 * * 1-5"   # Mon-Fri 5 PM IST (= 11:30 UTC Mon-Fri)
+  workflow_dispatch:          # also allow on-demand runs from the Actions tab
+                              # (this is what the "Run Now" link on the Confluence page opens)
+
+concurrency:
+  group: refresh-dashboard
+  cancel-in-progress: false  # never cancel an in-flight run; queue instead
+
+permissions:
+  contents: write            # needed to commit history.json back to the repo
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          # we need to push history.json back; default token is fine because
+          # `permissions: contents: write` above grants it push access to this repo.
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run dashboard refresh
+        env:
+          ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+          ATLASSIAN_TOKEN: ${{ secrets.ATLASSIAN_TOKEN }}
+          ATLASSIAN_DOMAIN: ${{ secrets.ATLASSIAN_DOMAIN || 'procoretech.atlassian.net' }}
+          CONFLUENCE_PAGE_ID: ${{ secrets.CONFLUENCE_PAGE_ID }}
+          E2E_RUNNER_TOKEN: ${{ secrets.E2E_RUNNER_TOKEN }}
+          DASHBOARD_TZ: ${{ vars.DASHBOARD_TZ || 'Asia/Kolkata' }}
+          CUTOFF_HOUR: ${{ vars.CUTOFF_HOUR || '17' }}
+          GITHUB_REPO_URL: ${{ vars.DASHBOARD_REPO_URL || format('{0}/{1}', github.server_url, github.repository) }}
+          GITHUB_WORKFLOW_FILE: dashboard.yml
+        run: python dashboard.py --run
+
+      - name: Commit history.json if changed
+        run: |
+          if [[ -n "$(git status --porcelain history.json)" ]]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add history.json
+            git commit -m "chore(history): refresh $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          else
+            echo "No changes to history.json; nothing to commit."
+          fi
