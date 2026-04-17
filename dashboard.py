@@ -244,17 +244,58 @@ def update_page(title: str, body_html: str, version: int) -> dict:
 # Config table parsing
 # ---------------------------------------------------------------------------
 
+@dataclass
+class TableLayout:
+    """Width/layout hints Confluence Cloud persists on a <table> element when the
+    user resizes it in the editor. We re-emit these verbatim on every refresh so
+    manual resizes stick across script-driven updates.
+
+    Attributes captured:
+      - data-layout         "default" | "wide" | "full-width"
+      - data-table-width    Explicit pixel width (set when user drags the edge)
+      - colgroup_html       Raw <colgroup> with per-column <col> widths
+    """
+    data_layout: Optional[str] = None
+    data_table_width: Optional[str] = None
+    colgroup_html: Optional[str] = None
+
+
+def _find_table_after_heading(body_html: str, heading_text: str):
+    """Return the BeautifulSoup <table> node immediately following a given h1/h2/h3."""
+    soup = BeautifulSoup(body_html or "", "html.parser")
+    for h in soup.find_all(["h1", "h2", "h3"]):
+        if h.get_text(strip=True).lower() == heading_text.lower():
+            return h.find_next("table")
+    return None
+
+
+def extract_table_layout(body_html: str, heading_text: str) -> TableLayout:
+    """Pull width hints off the existing table so we can preserve manual resizes."""
+    table = _find_table_after_heading(body_html, heading_text)
+    if table is None:
+        return TableLayout()
+    colgroup = table.find("colgroup")
+    return TableLayout(
+        data_layout=table.get("data-layout"),
+        data_table_width=table.get("data-table-width"),
+        colgroup_html=str(colgroup) if colgroup else None,
+    )
+
+
+def _render_table_open(layout: Optional[TableLayout]) -> str:
+    if not layout:
+        return "<table>"
+    attrs: list[str] = []
+    if layout.data_layout:
+        attrs.append(f'data-layout="{layout.data_layout}"')
+    if layout.data_table_width:
+        attrs.append(f'data-table-width="{layout.data_table_width}"')
+    return "<table" + (" " + " ".join(attrs) if attrs else "") + ">"
+
+
 def parse_config_from_body(body_html: str) -> list[RepoConfig]:
     """Find the <h2>Configuration</h2> section and extract the table below it."""
-    soup = BeautifulSoup(body_html or "", "html.parser")
-    heading = None
-    for h in soup.find_all(["h1", "h2", "h3"]):
-        if h.get_text(strip=True).lower() == CONFIG_HEADING.lower():
-            heading = h
-            break
-    if heading is None:
-        return []
-    table = heading.find_next("table")
+    table = _find_table_after_heading(body_html, CONFIG_HEADING)
     if table is None:
         return []
     repos: list[RepoConfig] = []
@@ -387,10 +428,16 @@ COLUMN_REGISTRY: dict[str, ColumnDef] = {
 }
 
 
-def build_results_table(runs: list[RunSummary], columns: Optional[list[str]] = None) -> str:
+def build_results_table(
+    runs: list[RunSummary],
+    columns: Optional[list[str]] = None,
+    layout: Optional[TableLayout] = None,
+) -> str:
     cols = columns if columns is not None else COLUMNS
     col_defs = [COLUMN_REGISTRY[k] for k in cols]  # KeyError surfaces typos loudly
 
+    open_tag = _render_table_open(layout)
+    colgroup = layout.colgroup_html if layout and layout.colgroup_html else ""
     header = "<tr>" + "".join(f"<th>{c.header}</th>" for c in col_defs) + "</tr>"
 
     if not runs:
@@ -398,7 +445,7 @@ def build_results_table(runs: list[RunSummary], columns: Optional[list[str]] = N
             f"<tr><td colspan='{len(cols)}'><em>No runs recorded yet. "
             f"The first scheduled refresh will populate this table.</em></td></tr>"
         )
-        return "<table>" + header + empty + "</table>"
+        return open_tag + colgroup + header + empty + "</table>"
 
     # Pre-compute rowspan for the "date" column (if present).
     has_date = "date" in cols
@@ -446,15 +493,20 @@ def build_results_table(runs: list[RunSummary], columns: Optional[list[str]] = N
                 cells.append(f"<td>{cdef.render(r)}</td>")
         rows.append("<tr>" + "".join(cells) + "</tr>")
 
-    return "<table>" + "".join(rows) + "</table>"
+    return open_tag + colgroup + "".join(rows) + "</table>"
 
 
-def build_config_table(repos: list[RepoConfig]) -> str:
+def build_config_table(
+    repos: list[RepoConfig],
+    layout: Optional[TableLayout] = None,
+) -> str:
+    open_tag = _render_table_open(layout)
+    colgroup = layout.colgroup_html if layout and layout.colgroup_html else ""
     header = "<tr><th>Display Name</th><th>Project Slug</th></tr>"
     rows = [header]
     for r in repos:
         rows.append(f"<tr><td>{r.display_name}</td><td>{r.project_slug}</td></tr>")
-    return "<table>" + "".join(rows) + "</table>"
+    return open_tag + colgroup + "".join(rows) + "</table>"
 
 
 def build_run_now_panel() -> str:
@@ -480,11 +532,25 @@ def build_run_now_panel() -> str:
     )
 
 
-def build_page_body(runs: list[RunSummary], repos: list[RepoConfig]) -> str:
+def build_page_body(
+    runs: list[RunSummary],
+    repos: list[RepoConfig],
+    previous_body_html: str = "",
+) -> str:
+    """Rebuild the Confluence page body.
+
+    If ``previous_body_html`` is provided, any manual table width / column-width
+    tweaks the user made in the editor are carried over to the new body. This
+    keeps the page from snapping back to the default narrow layout on every
+    auto-refresh.
+    """
+    results_layout = extract_table_layout(previous_body_html, RESULTS_HEADING)
+    config_layout = extract_table_layout(previous_body_html, CONFIG_HEADING)
+
     now = datetime.now().astimezone().strftime("%b %d, %Y at %I:%M %p %Z")
     parts = [
         f"<h2>{RESULTS_HEADING}</h2>",
-        build_results_table(runs),
+        build_results_table(runs, layout=results_layout),
         f"<p><em>Last updated: {now}</em></p>",
         "<hr/>",
         f"<h2>{CONFIG_HEADING}</h2>",
@@ -492,7 +558,7 @@ def build_page_body(runs: list[RunSummary], repos: list[RepoConfig]) -> str:
         "Use the <code>project-slug</code> from the E2E Runner "
         "(format: <code>procore/repo-name</code>). "
         "Changes take effect on the next scheduled run.</em></p>",
-        build_config_table(repos),
+        build_config_table(repos, layout=config_layout),
         build_run_now_panel(),
     ]
     return "".join(parts)
@@ -582,12 +648,18 @@ def _next_version(page: dict) -> int:
 def cmd_init(dry_run: bool) -> None:
     validate_env()
     repos = [RepoConfig(n, s) for n, s in DEFAULT_REPOS]
+
+    # Pull the existing page first so we can preserve any manual table widths
+    # the user has set. On a brand-new page this just returns empty layouts,
+    # which is the correct no-op behavior.
+    page = None if dry_run else get_page()
+    previous_body = (page.get("body", {}).get("storage", {}).get("value", "") if page else "")
+
     # Empty history on first init -- rows will be added by subsequent --run calls.
-    body = build_page_body([], repos)
+    body = build_page_body([], repos, previous_body_html=previous_body)
     if dry_run:
         print(body)
         return
-    page = get_page()
     title = page.get("title") or "E2E Dashboard"
     version = _next_version(page)
     update_page(title, body, version)
@@ -666,7 +738,7 @@ def cmd_run(dry_run: bool) -> None:
         reverse=True,
     )
 
-    new_body = build_page_body(history, repos)
+    new_body = build_page_body(history, repos, previous_body_html=body_html)
     if dry_run:
         print("\n--- DRY RUN: would write the following HTML ---\n")
         print(new_body)

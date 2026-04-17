@@ -122,9 +122,24 @@ curl -s "https://e2e-test-runner-service.us00.ops.procoretech.com/v1/e2e-tests/f
 
 The workflow at `.github/workflows/dashboard.yml` runs the refresh every weekday at **5 PM IST** (11:30 UTC; IST has no DST so a single cron entry suffices). It also commits the updated `history.json` back to `main` so the history persists.
 
+> ⚠️ **Self-hosted runner required.** The E2E Runner API (`e2e-test-runner-service.us00.ops.procoretech.com`) resolves to a `10.x.x.x` private LB behind Procore VPN. GitHub-hosted runners on Azure cannot reach it and will hang until the 10-minute workflow timeout. The workflow therefore targets `runs-on: [self-hosted, macOS, e2e-dashboard]` -- you need a VPN-connected Mac registered as a self-hosted runner (see setup below).
+
 ### On-demand refresh
 
 The Confluence page renders a "Run Now" info panel below the Configuration table. Clicking it opens the workflow in GitHub Actions, where you can click **Run workflow** → **Run workflow** to trigger a refresh immediately (e.g., right after editing the Configuration table). No infrastructure required beyond this repo and Actions.
+
+### Ways to initiate a refresh
+
+All four require the self-hosted runner's Mac to be awake and connected to Procore VPN at the moment the job runs.
+
+| Method | How |
+|---|---|
+| **Automatic (daily)** | Nothing to do. Cron fires at 5 PM IST weekdays; runner picks it up. |
+| **"Run Now" link in Confluence** | Click the info panel below the Configuration table → **Run workflow** → **Run workflow**. |
+| **GitHub web UI** | <https://github.com/raghunandan-k/e2e-dashboard/actions/workflows/dashboard.yml> → **Run workflow** → **Run workflow**. |
+| **Terminal (`gh` CLI)** | `gh workflow run dashboard.yml --repo raghunandan-k/e2e-dashboard` |
+
+Watch a run live from the terminal: `gh run watch --repo raghunandan-k/e2e-dashboard`.
 
 ### One-time setup
 
@@ -165,7 +180,46 @@ The Confluence page renders a "Run Now" info panel below the Configuration table
    - Select **Read and write permissions** (needed so the workflow can commit `history.json` back to the repo)
    - Save
 
-5. **Run the workflow manually once to verify**: go to the **Actions** tab, pick **Refresh E2E Dashboard**, click **Run workflow**. If everything is configured correctly, it should update the Confluence page and push a `chore(history): ...` commit.
+5. **Register a self-hosted runner** on a Procore-VPN-connected Mac. This is required because the E2E Runner API is VPN-gated (see the warning at the top of this section). The runner is a small daemon that polls GitHub for jobs and executes them on your Mac.
+
+   ```bash
+   # 1. Pull a single-use registration token (valid for 1 hour)
+   gh api -X POST /repos/raghunandan-k/e2e-dashboard/actions/runners/registration-token --jq .token
+
+   # 2. Download the runner (use arm64 for Apple Silicon, x64 for Intel)
+   RUNNER_VERSION=$(gh api /repos/actions/runner/releases/latest --jq .tag_name | sed 's/^v//')
+   mkdir -p ~/actions-runner-e2e-dashboard && cd ~/actions-runner-e2e-dashboard
+   curl -sSL -o runner.tar.gz \
+     "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-osx-arm64-${RUNNER_VERSION}.tar.gz"
+   tar xzf runner.tar.gz && rm runner.tar.gz
+
+   # 3. Register (substitute the token from step 1)
+   ./config.sh \
+     --url https://github.com/raghunandan-k/e2e-dashboard \
+     --token <TOKEN_FROM_STEP_1> \
+     --name "$(whoami)-mac-e2e-dashboard" \
+     --labels "e2e-dashboard" \
+     --unattended --replace
+
+   # 4. Install + start as a launchd service (auto-starts at login)
+   ./svc.sh install && ./svc.sh start && ./svc.sh status
+   ```
+
+   Verify from GitHub:
+
+   ```bash
+   gh api /repos/raghunandan-k/e2e-dashboard/actions/runners \
+     --jq '.runners[] | "\(.name): \(.status)"'
+   # expected: aditya-mac-e2e-dashboard: online
+   ```
+
+   Also required: create `/Users/runner` owned by your user (it's a hardcoded path used by some macOS Python installers; harmless to leave empty):
+
+   ```bash
+   sudo mkdir -p /Users/runner && sudo chown $(whoami):admin /Users/runner
+   ```
+
+6. **Run the workflow manually once to verify**: go to the **Actions** tab, pick **Refresh E2E Dashboard**, click **Run workflow**. If everything is configured correctly, it should update the Confluence page and push a `chore(history): ...` commit within ~45 seconds.
 
 ### Token maintenance
 
@@ -189,6 +243,61 @@ The short-circuit logic is defensive: if the token is dead, the script does **no
 ### Long-term fix
 
 The real fix is a service-account / long-lived API key from the E2E Runner team. Worth asking them whether that's available -- it would eliminate this rotation entirely.
+
+## Self-hosted runner maintenance
+
+### Useful commands
+
+Run these from the runner directory (`~/actions-runner-e2e-dashboard`) unless noted otherwise.
+
+| What you want to check / do | Command |
+|---|---|
+| Is the runner daemon alive locally? | `./svc.sh status` |
+| Is GitHub seeing the runner as online? | `gh api /repos/raghunandan-k/e2e-dashboard/actions/runners --jq '.runners[] \| "\(.name): \(.status)"'` |
+| Tail the runner's own logs (not workflow logs) | `tail -f _diag/Runner_*.log` |
+| Restart after a Mac reboot if it didn't auto-start | `./svc.sh start` |
+| Stop the runner temporarily (e.g., heavy local work) | `./svc.sh stop` |
+| Unregister and remove (before wiping the Mac) | `./svc.sh uninstall && ./config.sh remove --token <NEW_REG_TOKEN>` |
+| Upgrade to the latest runner version | `./svc.sh stop && ./config.sh remove --token <TOKEN> && <repeat setup step 5>` |
+| See recent workflow runs | `gh run list --workflow dashboard.yml --repo raghunandan-k/e2e-dashboard --limit 10` |
+| View logs for a specific run | `gh run view <RUN_ID> --log --repo raghunandan-k/e2e-dashboard` |
+
+### Preventing Mac sleep during scheduled runs (optional)
+
+If the Mac is asleep at 5 PM IST the cron-triggered job will sit in GitHub's queue until the Mac wakes up (then run normally). If you want the job to fire on time every weekday regardless, prevent sleep while on power:
+
+```bash
+# Don't sleep the system while on AC power; screen can still sleep.
+sudo pmset -c sleep 0 disablesleep 1
+
+# Revert:
+sudo pmset -c sleep 0 disablesleep 0
+```
+
+On battery this setting is ignored. Alternatively, schedule a daily wake in System Settings → Battery → Schedule a few minutes before 5 PM IST.
+
+### Where things live on the runner
+
+| Thing | Path |
+|---|---|
+| Runner binary + config | `~/actions-runner-e2e-dashboard/` |
+| Runner daemon logs | `~/actions-runner-e2e-dashboard/_diag/` |
+| Per-run workspace (auto-cleaned) | `~/actions-runner-e2e-dashboard/_work/e2e-dashboard/e2e-dashboard/` |
+| `launchd` plist | `~/Library/LaunchAgents/actions.runner.<repo>.<name>.plist` |
+| Homebrew Python used by the workflow | `/opt/homebrew/bin/python3` |
+
+### Fully removing the runner
+
+```bash
+cd ~/actions-runner-e2e-dashboard
+./svc.sh stop && ./svc.sh uninstall
+
+# Pull a fresh removal token (different endpoint from registration)
+REMOVE_TOKEN=$(gh api -X POST /repos/raghunandan-k/e2e-dashboard/actions/runners/remove-token --jq .token)
+./config.sh remove --token "$REMOVE_TOKEN"
+
+cd ~ && rm -rf ~/actions-runner-e2e-dashboard
+```
 
 ## Local scheduling (alternative)
 
